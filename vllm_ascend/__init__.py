@@ -16,6 +16,7 @@
 #
 
 _GLOBAL_PATCH_APPLIED = False
+print("changed by hp")
 
 
 def _ensure_global_patch():
@@ -76,3 +77,4 @@ def register_model():
 
 
 import vllm_ascend.logger  # noqa: E402, F401
+print("changed by hp")
