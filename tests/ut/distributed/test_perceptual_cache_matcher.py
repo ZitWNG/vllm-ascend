@@ -267,7 +267,8 @@ def test_persist_missed_resized_tensor_persists_only_after_matching() -> None:
 
     assert matcher.get_cached_phash("query") == 123
     assert matcher._index.phash_to_resized_mm_hashes[123] == [expected_key]
-    assert matcher._tensor_store.values == {expected_key: resized}
+    assert set(matcher._tensor_store.values) == {expected_key}
+    torch.testing.assert_close(matcher._tensor_store.values[expected_key], resized)
     matcher.shutdown()
 
 

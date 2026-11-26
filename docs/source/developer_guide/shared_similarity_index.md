@@ -79,6 +79,36 @@ Do not add the DP rank to the endpoint or namespace. All DPs must also access th
 same Memcache data. Multiple DP schedulers without an endpoint still use separate
 local indexes and emit a warning.
 
+## Skip similarity matching for small images
+
+Set `ec_connector_extra_config.similarity_cache.min_image_patches` to a
+nonnegative integer. The default `0` disables this gate and preserves existing
+behavior. For example, add `"min_image_patches": 256` to the `similarity_cache`
+object to bypass similarity processing for images with fewer than 256 patches.
+This is an illustrative threshold, not a hardware-tuned recommendation.
+
+The count is `pixel_values.shape[0]` in the supported Qwen image layout
+`(num_patches, patch_dim)`: patches **after image preprocessing and before
+spatial merging**, not original file bytes, original image pixels, or merged
+embedding tokens. An image exactly at the threshold still uses similarity
+matching. Videos and unavailable or unsupported image tensors retain their
+existing behavior. Configure the same threshold on every DP for consistent
+policy; this local admission setting does not change shared score compatibility.
+
+Exact embedding hits still take priority. On an exact miss, a small image skips
+both similarity prewarming and final matching, including cached similarity
+matches. Its encoder runs normally and the resulting embedding is saved under
+the original hash. The gate does not compute/register pHashes or persist resized
+tensors for skipped images. These decisions count as `misses` in the existing
+statistics, including the denominator of `similarity_lookup_hit_rate`; they do
+not represent attempted similarity lookups. Existing statistics reporting RPCs
+and exact-cache probes still run.
+
+Tune the threshold using encoder latency, scheduler latency and end-to-end
+throughput on the actual model/NPU workload. Processor resizing can enlarge a
+small original image. The relative cost also depends on batch size, candidate
+count, cache state and Memcache/index latency.
+
 ## Optional independently managed mode
 
 For an index whose lifecycle is independent of DP0, set

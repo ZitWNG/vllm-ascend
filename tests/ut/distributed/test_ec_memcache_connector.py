@@ -1,5 +1,6 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
@@ -220,6 +221,114 @@ def _make_scheduler_connector() -> ECMemcacheConnector:
     return connector
 
 
+@pytest.mark.parametrize("threshold", [0, 256])
+def test_similarity_cache_min_image_patches_config(threshold: int) -> None:
+    vllm_config = MagicMock()
+    vllm_config.ec_transfer_config.get_from_extra_config.return_value = {"min_image_patches": threshold}
+    assert SimilarityCacheConfig.from_vllm_config(vllm_config).min_image_patches == threshold
+    vllm_config.ec_transfer_config.get_from_extra_config.return_value = {}
+    assert SimilarityCacheConfig.from_vllm_config(vllm_config).min_image_patches == 0
+
+
+@pytest.mark.parametrize("threshold", [-1, True, False, 1.5, "256", None])
+def test_similarity_cache_rejects_invalid_min_image_patches(threshold: object) -> None:
+    with pytest.raises(ValueError, match="min_image_patches must be a nonnegative integer"):
+        SimilarityCacheConfig(min_image_patches=threshold)
+    vllm_config = MagicMock()
+    vllm_config.ec_transfer_config.get_from_extra_config.return_value = {"min_image_patches": threshold}
+    with pytest.raises(ValueError, match="min_image_patches must be a nonnegative integer"):
+        SimilarityCacheConfig.from_vllm_config(vllm_config)
+
+
+def _image_feature(identifier: str, patches: int) -> SimpleNamespace:
+    return SimpleNamespace(identifier=identifier, data={"pixel_values": SimpleNamespace(data=torch.empty(patches, 8))})
+
+
+@pytest.mark.parametrize(
+    ("threshold", "patches", "skip"), [(256, 255, True), (256, 256, False), (256, 257, False), (0, 4, False)]
+)
+def test_small_image_gate_controls_prewarm_and_final_decision(threshold: int, patches: int, skip: bool) -> None:
+    connector = _make_scheduler_connector()
+    connector._similarity_config = SimilarityCacheConfig(enabled=True, min_image_patches=threshold)
+    connector._backend.exists.return_value = [0]
+    connector._cache_matcher.get_cached_similarity_match.return_value = "candidate"
+    feature = _image_feature("query", patches)
+    request = SimpleNamespace(mm_features=[feature], num_prompt_tokens=100)
+
+    assert connector.ensure_cache_available(request, 0)
+    connector.update_state_after_alloc(request, 0)
+
+    if skip:
+        assert connector._cache_matcher.mock_calls == []
+        assert connector._mm_hashes_need_saves == {"query"}
+        assert connector._mm_hashes_need_loads == set()
+        assert connector._mm_hash_to_store_key == {}
+        assert connector.cache_statistics == CacheStatistics(0, 0, 1)
+    else:
+        connector._cache_matcher.batch_ensure_similarity_cache_available.assert_called_once_with(["query"], [feature])
+        assert connector._mm_hashes_need_loads == {"query"}
+        assert connector._mm_hashes_need_saves == set()
+        assert connector._mm_hash_to_store_key == {"query": "candidate"}
+        assert connector.cache_statistics == CacheStatistics(0, 1, 0)
+
+
+def test_small_image_gate_filters_mixed_prewarm_batch() -> None:
+    connector = _make_scheduler_connector()
+    connector._similarity_config = SimilarityCacheConfig(enabled=True, min_image_patches=256)
+    connector._backend.exists.return_value = [0, 0, 0]
+    small = _image_feature("small", 4)
+    large = _image_feature("large", 256)
+    video = SimpleNamespace(identifier="video", data={"pixel_values_videos": SimpleNamespace(data=torch.empty(4, 8))})
+    request = SimpleNamespace(mm_features=[small, large, video], num_prompt_tokens=100)
+
+    connector.ensure_cache_available(request, 0)
+
+    connector._cache_matcher.batch_ensure_similarity_cache_available.assert_called_once_with(
+        ["large", "video"], [large, video]
+    )
+    assert connector.cache_statistics == CacheStatistics(0, 0, 0)
+
+
+@pytest.mark.parametrize("exact_hit", [False, True])
+def test_small_image_final_gate_without_prewarm(exact_hit: bool) -> None:
+    connector = _make_scheduler_connector()
+    connector._similarity_config = SimilarityCacheConfig(enabled=True, min_image_patches=256)
+    connector._cache_matcher.get_cached_similarity_match.return_value = "candidate"
+    if exact_hit:
+        connector._mm_hash_hits.add("query")
+
+    connector.update_state_after_alloc(SimpleNamespace(mm_features=[_image_feature("query", 4)]), 0)
+
+    assert connector._cache_matcher.mock_calls == []
+    assert connector._mm_hashes_need_loads == ({"query"} if exact_hit else set())
+    assert connector._mm_hashes_need_saves == (set() if exact_hit else {"query"})
+    assert connector.cache_statistics == (CacheStatistics(1, 0, 0) if exact_hit else CacheStatistics(0, 0, 1))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        {},
+        {"pixel_values": SimpleNamespace(data=None)},
+        {"pixel_values": SimpleNamespace(data=torch.empty(1, 3, 4, 4))},
+        {"pixel_values_videos": SimpleNamespace(data=torch.empty(4, 8))},
+    ],
+)
+def test_small_image_gate_preserves_unavailable_data_and_video_behavior(data: object) -> None:
+    connector = _make_scheduler_connector()
+    connector._similarity_config = SimilarityCacheConfig(enabled=True, min_image_patches=256)
+    connector._cache_matcher.get_cached_similarity_match.return_value = "candidate"
+    feature = SimpleNamespace(identifier="query", data=data)
+
+    connector._ensure_similarity_cache_available([feature])
+    connector.update_state_after_alloc(SimpleNamespace(mm_features=[feature]), 0)
+
+    connector._cache_matcher.batch_ensure_similarity_cache_available.assert_called_once_with(["query"], [feature])
+    assert connector._mm_hash_to_store_key == {"query": "candidate"}
+    assert connector.cache_statistics == CacheStatistics(0, 1, 0)
+
+
 def test_update_state_after_alloc_uses_cached_ssim_match() -> None:
     connector = _make_scheduler_connector()
     connector._cache_matcher.get_cached_similarity_match.return_value = "candidate"
@@ -281,20 +390,18 @@ def test_update_state_after_alloc_records_similarity_miss(
         matcher.find_and_cache_matched_ssim.return_value = match_result
     request = MagicMock(mm_features=[MagicMock(identifier="query", data="query-data")])
 
-    operation_order: list[str] = []
-    matcher.persist_missed_resized_tensor.side_effect = lambda *_: operation_order.append("persist")
-    original_record_miss = connector._record_similarity_miss
+    queued_before_persist: list[bool] = []
 
-    def record_miss(mm_hash: str, **kwargs):
-        operation_order.append("record")
-        original_record_miss(mm_hash, **kwargs)
+    def check_persist_before_save(mm_hash: str, _feature: object) -> None:
+        queued_before_persist.append(mm_hash in connector._mm_hashes_need_saves)
 
-    with patch.object(connector, "_record_similarity_miss", side_effect=record_miss) as record:
+    matcher.persist_missed_resized_tensor.side_effect = check_persist_before_save
+    with patch.object(connector, "_record_similarity_miss", wraps=connector._record_similarity_miss) as record:
         connector.update_state_after_alloc(request, 0)
 
     record.assert_called_once_with("query", reason=expected_reason, feature="query-data")
     matcher.persist_missed_resized_tensor.assert_called_once_with("query", "query-data")
-    assert operation_order == ["persist", "record"]
+    assert queued_before_persist == [False]
     assert connector._mm_hashes_need_saves == {"query"}
     assert connector._mm_hashes_need_loads == set()
 
@@ -335,7 +442,7 @@ def test_ensure_cache_available_skips_similarity_prewarm_when_disabled() -> None
     connector._mm_hash_hit_count = 0
     exact_feature = MagicMock(identifier="request-exact", data="exact-data")
     missing_feature = MagicMock(identifier="request-missing", data="missing-data")
-    request = MagicMock(mm_features=[exact_feature, missing_feature])
+    request = MagicMock(mm_features=[exact_feature, missing_feature], num_prompt_tokens=100)
 
     assert connector.ensure_cache_available(request, 0)
 
@@ -346,7 +453,7 @@ def test_ensure_cache_available_skips_similarity_prewarm_when_disabled() -> None
 def test_exact_hit_count_is_recorded_when_cache_is_loaded() -> None:
     connector = _make_scheduler_connector()
     connector._backend.exists.return_value = [1]
-    request = MagicMock(mm_features=[MagicMock(identifier="request-exact", data="exact-data")])
+    request = MagicMock(mm_features=[MagicMock(identifier="request-exact", data="exact-data")], num_prompt_tokens=100)
 
     connector.ensure_cache_available(request, 0)
     assert connector._mm_hash_hits == {"request-exact"}

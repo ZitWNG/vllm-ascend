@@ -54,6 +54,7 @@ from vllm.logger import logger
 from vllm_ascend.distributed.ec_transfer.cache_statistics import CacheStatistics
 from vllm_ascend.distributed.ec_transfer.perceptual_ssim_cache_matcher import (
     PhashSSIMCacheMatcher,
+    extract_resized_tensor,
 )
 from vllm_ascend.distributed.ec_transfer.similarity_cache_config import (
     SimilarityCacheConfig,
@@ -311,6 +312,12 @@ class ECMemcacheConnector(ECConnectorBase):
         if current_image_mm_hash in self._mm_hash_hits:
             self._mm_hashes_need_loads.add(current_image_mm_hash)
             self._mm_hash_hit_count += 1
+            return
+
+        if self._skip_similarity_for_small_image(feature):
+            # Do not pass feature data: this miss must not persist a resized
+            # tensor or register similarity metadata, only save the embedding.
+            self._record_similarity_miss(current_image_mm_hash, reason="image_below_size_threshold")
             return
 
         similarity_enabled = self._similarity_config.enabled
@@ -575,10 +582,25 @@ class ECMemcacheConnector(ECConnectorBase):
                 missing_features.append(feature_by_mm_hash[current_image_mm_hash])
         return missing_features
 
+    def _skip_similarity_for_small_image(self, feature: Any) -> bool:
+        config = self._similarity_config
+        if not config.enabled or config.min_image_patches == 0:
+            return False
+        data = feature.data
+        if data is None or "pixel_values" not in data:
+            return False
+        pixels = extract_resized_tensor(data)
+        # Qwen image inputs have shape (num_patches, patch_dim). Reading shape
+        # avoids copying pixel/grid values or synchronizing the device.
+        return pixels is not None and pixels.ndim == 2 and pixels.shape[0] < config.min_image_patches
+
     def _ensure_similarity_cache_available(
         self,
         exact_match_missing_features: list[Any],
     ) -> None:
+        exact_match_missing_features = [
+            feature for feature in exact_match_missing_features if not self._skip_similarity_for_small_image(feature)
+        ]
         matcher = self._cache_matcher
         if matcher is None or not exact_match_missing_features:
             return

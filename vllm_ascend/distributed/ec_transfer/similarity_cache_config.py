@@ -53,8 +53,17 @@ class SimilarityCacheConfig:
     # Embedded mode starts the metadata server in serving DP index zero.
     # External mode connects to a separately managed service instead.
     shared_index_mode: str = "embedded"
+    # Minimum preprocessed image patch count for optional similarity matching.
+    # Zero disables the gate. Exact embedding hits and videos are unaffected.
+    min_image_patches: int = 0
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.min_image_patches, bool)
+            or not isinstance(self.min_image_patches, int)
+            or self.min_image_patches < 0
+        ):
+            raise ValueError("similarity_cache.min_image_patches must be a nonnegative integer")
         if self.shared_index_mode not in ("embedded", "external"):
             raise ValueError("similarity_cache.shared_index_mode must be embedded or external")
         endpoint = self.shared_index_endpoint
@@ -177,4 +186,5 @@ class SimilarityCacheConfig:
             shared_index_namespace=raw.get("shared_index_namespace", "default"),
             shared_index_timeout_ms=raw.get("shared_index_timeout_ms", DEFAULT_SHARED_INDEX_TIMEOUT_MS),
             shared_index_mode=raw.get("shared_index_mode", "embedded"),
+            min_image_patches=raw.get("min_image_patches", 0),
         )
